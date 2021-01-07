@@ -1,5 +1,8 @@
 package com.github.pvasilev
 
+import java.net.Inet4Address
+import java.net.Inet6Address
+import java.net.InetAddress
 import java.nio.ByteBuffer
 
 sealed class Message(val header: Header)
@@ -47,21 +50,61 @@ class Question(
 	}
 }
 
-class Answer(header: Header) : Message(header)
+class Answer(
+	header: Header,
+	val hostname: String,
+	val addresses: List<InetAddress>,
+) : Message(header) {
+
+	companion object {
+		@ExperimentalUnsignedTypes
+		fun deserialize(bytes: ByteArray): Answer {
+			val buffer = ByteBuffer.wrap(bytes)
+			val header = Header.deserialize(bytes)
+			buffer.position(12)
+			val hostname = mutableListOf<String>()
+				.apply {
+					var size = buffer.get()
+					while (size.toInt() != 0) {
+						val dst = ByteArray(size.toInt())
+						buffer.get(dst)
+						this += String(dst)
+						size = buffer.get()
+					}
+				}
+				.joinToString(separator = ".")
+			buffer.position(buffer.position() + 4)
+			val addresses = mutableListOf<InetAddress>()
+			for (i in 0 until header.anCount) {
+				val skip = 2 + 2 + 2 + 4
+				buffer.position(buffer.position() + skip)
+				val rdLength = buffer.short.toInt()
+				val addr = ByteArray(rdLength)
+				buffer.get(addr)
+				addresses += if (rdLength == 4) {
+					Inet4Address.getByAddress(addr)
+				} else {
+					Inet6Address.getByAddress(addr)
+				}
+			}
+			return Answer(header, hostname, addresses)
+		}
+	}
+}
 
 class Header(
 	val id: Short,
-	val qr: Qr,
-	val opcode: Opcode,
-	val aa: Boolean,
-	val tc: Boolean,
-	val rd: Boolean,
-	val ra: Boolean,
-	val rcode: Rcode,
-	val qdCount: Short,
-	val anCount: Short,
-	val nsCount: Short,
-	val arCount: Short
+	val qr: Qr = Qr.QUERY,
+	val opcode: Opcode = Opcode.QUERY,
+	val aa: Boolean = false,
+	val tc: Boolean = false,
+	val rd: Boolean = false,
+	val ra: Boolean = false,
+	val rcode: Rcode = Rcode.NO_ERROR,
+	val qdCount: Short = 1,
+	val anCount: Short = 0,
+	val nsCount: Short = 0,
+	val arCount: Short = 0
 ) {
 
 	enum class Qr {
@@ -77,10 +120,51 @@ class Header(
 
 	enum class Rcode {
 		NO_ERROR,
+		FORMAT_ERROR,
 		SERVER_FAILURE,
 		NAME_ERROR,
 		NOT_IMPLEMENTED,
 		REFUSED
+	}
+
+	companion object {
+		@ExperimentalUnsignedTypes
+		fun deserialize(bytes: ByteArray): Header {
+			val buffer = ByteBuffer.wrap(bytes)
+			val id = buffer.short
+			val flags = buffer.short
+			val qdCount = buffer.short
+			val anCount = buffer.short
+			val nsCount = buffer.short
+			val arCount = buffer.short
+			return Header(
+				id = id,
+				qr = if (flags.toUInt() shr 15 and 1u == 1u) Qr.RESPONSE else Qr.QUERY,
+				opcode = when (flags.toUInt() shr 11 and 15u) {
+					0u -> Opcode.QUERY
+					1u -> Opcode.IQUERY
+					2u -> Opcode.STATUS
+					else -> throw IllegalStateException()
+				},
+				aa = flags.toUInt() shr 10 and 1u == 1u,
+				tc = flags.toUInt() shr 9 and 1u == 1u,
+				rd = flags.toUInt() shr 8 and 1u == 1u,
+				ra = flags.toUInt() shr 7 and 1u == 1u,
+				rcode = when (flags.toUInt() and 15u) {
+					0u -> Rcode.NO_ERROR
+					1u -> Rcode.FORMAT_ERROR
+					2u -> Rcode.SERVER_FAILURE
+					3u -> Rcode.NAME_ERROR
+					4u -> Rcode.NOT_IMPLEMENTED
+					5u -> Rcode.REFUSED
+					else -> throw IllegalStateException()
+				},
+				qdCount = qdCount,
+				anCount = anCount,
+				nsCount = nsCount,
+				arCount = arCount
+			)
+		}
 	}
 
 	fun serialize(): ByteBuffer {
@@ -103,10 +187,11 @@ class Header(
 			append("000")
 			when (rcode) {
 				Rcode.NO_ERROR -> append("0000")
-				Rcode.SERVER_FAILURE -> append("0001")
-				Rcode.NAME_ERROR -> append("0010")
-				Rcode.NOT_IMPLEMENTED -> append("0011")
-				Rcode.REFUSED -> append("0100")
+				Rcode.FORMAT_ERROR -> append("0001")
+				Rcode.SERVER_FAILURE -> append("0010")
+				Rcode.NAME_ERROR -> append("0011")
+				Rcode.NOT_IMPLEMENTED -> append("0100")
+				Rcode.REFUSED -> append("0101")
 			}
 		}
 		buffer.putShort(flags.toShort(radix = 2))
